@@ -1,0 +1,147 @@
+"""
+STIR Policy-Path → Fair-Value OIS Demo
+Author: William Nelson
+Description:
+    1. Simulate macro surprises & past policy moves
+    2. Fit multinomial logit P(Δpolicy | surprises)
+    3. Predict expected per-meeting move μ_k
+    4. Build expected overnight-rate path
+    5. Discount/compound to fair OIS rates
+"""
+
+import numpy as np
+import pandas as pd
+import datetime as dt
+from dateutil.relativedelta import relativedelta
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------
+# 1) Simulate historical dataset
+# ------------------------------------------------------------
+np.random.seed(42)
+
+n_hist = 80  # past FOMC meetings (~10 years)
+cpi_surprise = np.random.normal(0, 0.2, n_hist)
+unemp_surprise = np.random.normal(0, 0.15, n_hist)
+ism_surprise = np.random.normal(0, 1.0, n_hist)
+
+# Actual Fed moves in bp categories [-50, -25, 0, +25, +50]
+def draw_move(cpi, u, ism):
+    z = 0.6 * cpi - 0.4 * u + 0.2 * ism + np.random.normal(0, 0.5)
+    if z > 1.0: return +50
+    if z > 0.3: return +25
+    if z > -0.3: return 0
+    if z > -1.0: return -25
+    return -50
+
+moves = np.array([
+    draw_move(cpi_surprise[i], unemp_surprise[i], ism_surprise[i])
+    for i in range(n_hist)
+])
+
+df_hist = pd.DataFrame({
+    "CPI": cpi_surprise,
+    "UNEMP": unemp_surprise,
+    "ISM": ism_surprise,
+    "MOVE": moves
+})
+
+# ------------------------------------------------------------
+# 2) Fit multinomial logit
+# ------------------------------------------------------------
+X = sm.add_constant(df_hist[["CPI", "UNEMP", "ISM"]])
+y = df_hist["MOVE"]
+model = sm.MNLogit(y, X)
+res = model.fit(disp=False)
+print(res.summary())
+
+# ------------------------------------------------------------
+# 3) Predict expected moves for next meetings
+# ------------------------------------------------------------
+future_cpi = np.array([+0.30, +0.10, -0.05])     # inflation cooling
+future_unemp = np.array([-0.10, +0.05, +0.10])   # labor loosening
+future_ism = np.array([+1.0, +0.3, -0.5])        # manufacturing slowing
+n_future = len(future_cpi)
+
+X_future = sm.add_constant(pd.DataFrame({
+    "CPI": future_cpi,
+    "UNEMP": future_unemp,
+    "ISM": future_ism
+}))
+
+probs = res.predict(X_future)
+move_grid = np.array(sorted(df_hist.MOVE.unique()))
+exp_moves = (probs.values * move_grid).sum(axis=1) / 10000  # expected Δ in decimals
+print("\nExpected moves (decimals):", exp_moves)
+
+# ------------------------------------------------------------
+# 4) Build expected policy path (step function)
+# ------------------------------------------------------------
+today = dt.date.today()
+meetings = [today + relativedelta(months=2 * i) for i in range(1, n_future + 1)]
+r0 = 0.0525
+path_dates, path_rates = [today], [r0]
+rate = r0
+for i, m in enumerate(meetings):
+    rate += exp_moves[i]
+    path_dates.append(m)
+    path_rates.append(rate)
+
+df_path = pd.DataFrame({"Date": path_dates, "Rate": path_rates})
+
+# ------------------------------------------------------------
+# 5) Discount factors & fair OIS rates (FIXED FOR PANDAS 2.2+)
+# ------------------------------------------------------------
+def act360(d1, d2):
+    return (d2 - d1).days / 360.0
+
+def fair_ois(maturity_months):
+    T = today + relativedelta(months=maturity_months)
+    days = pd.date_range(today, T, freq="B")
+
+    # Convert dates to numeric (safe for interpolation)
+    x = pd.to_datetime(df_path["Date"]).values.astype("datetime64[D]").astype(float)
+    y = df_path["Rate"].values
+    x_new = days.values.astype("datetime64[D]").astype(float)
+
+    r_daily = np.interp(x_new, x, y)
+    alpha = 1 / 360
+    logD = -np.sum(np.log1p(r_daily * alpha))
+    D = np.exp(logD)
+    return (1 / D - 1) / act360(today, T)
+
+tenors = [1, 3, 6, 12, 24]
+ois_fair = [fair_ois(m) for m in tenors]
+ois_market = [r + np.random.uniform(-0.0005, 0.0005) for r in ois_fair]
+
+df_curve = pd.DataFrame({
+    "TenorM": tenors,
+    "FairOIS": ois_fair,
+    "MktOIS": ois_market
+})
+df_curve["Mispricing_bps"] = (df_curve["MktOIS"] - df_curve["FairOIS"]) * 10000
+
+print("\nFair-value OIS curve:")
+print(df_curve.round(6))
+
+# ------------------------------------------------------------
+# 6) Plots
+# ------------------------------------------------------------
+plt.figure(figsize=(7, 4))
+plt.plot(df_curve.TenorM, df_curve.FairOIS * 100, "o-", label="Fair OIS")
+plt.plot(df_curve.TenorM, df_curve.MktOIS * 100, "s--", label="Market OIS")
+plt.xlabel("Tenor (months)")
+plt.ylabel("Rate (%)")
+plt.title("Fair vs Market OIS")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(7, 4))
+plt.step(df_path.Date, np.array(df_path.Rate) * 100)
+plt.ylabel("Policy Rate (%)")
+plt.title("Expected Policy Path (stepwise)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
